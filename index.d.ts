@@ -15,7 +15,7 @@ interface JSZipSupport {
 
 type Compression = 'STORE' | 'DEFLATE';
 
-interface Metadata  {
+interface Metadata {
     percent: number;
     currentFile: string;
 }
@@ -136,6 +136,8 @@ declare namespace JSZip {
         streamFiles?: boolean;
         /** DOS (default) or UNIX */
         platform?: 'DOS' | 'UNIX';
+        password?: string;
+        encryptStrength?: number;
     }
 
     interface JSZipLoadOptions {
@@ -147,7 +149,7 @@ declare namespace JSZip {
 }
 
 interface JSZip {
-    files: {[key: string]: JSZip.JSZipObject};
+    files: { [key: string]: JSZip.JSZipObject };
 
     /**
      * Get a file from the archive
@@ -253,7 +255,7 @@ interface JSZip {
      * @param data Serialized zip archive
      * @param options Description of the serialized zip archive
      */
-    new (data?: InputFileFormat, options?: JSZip.JSZipLoadOptions): this;
+    new(data?: InputFileFormat, options?: JSZip.JSZipLoadOptions): this;
 
     (): JSZip;
 

@@ -12,6 +12,149 @@ https://github.com/nodeca/pako/blob/master/LICENSE
 
 (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.JSZip = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 'use strict';
+var sjcl = require('./sjcl');
+var utils = require("./utils");
+var GenericWorker = require("./stream/GenericWorker");
+
+var passwordVerifierLen = 2;
+var authCodeLen = 10;
+
+/**
+ * Create a worker that uses sjcl to process file data.
+ * @constructor
+ * @param dir The direction, 0 for decrypt and 1 for encrypt.
+ * @param {Object|bitArray} param the aesKey for decrypt or the options for encrypt.
+ */
+function AesWorker(dir, param) {
+    GenericWorker.call(this, "AesWorker");
+
+    this._aes = null;
+    this._aesKey = null;
+    this._mac = null;
+    this._dir = dir;
+
+    if (this._dir) {
+        this._password = param.password;
+        this._keyLen = this._macLen = 8 * param.strength + 8;
+        this._saltLen = this._keyLen /2;
+    } else {
+        this._aesKey = param;
+    }    
+
+    // the `meta` object from the last chunk received
+    // this allow this worker to pass around metadata
+    this.meta = {};
+}
+
+utils.inherits(AesWorker, GenericWorker);
+
+/**
+ * @see GenericWorker.processChunk
+ */
+AesWorker.prototype.processChunk = function (chunk) {
+    this.meta = chunk.meta;
+
+    if (this._aes === null) {
+        this._createAes();
+    }
+    var result = this._aes.update(sjcl.codec.bytes.toBits(chunk.data));
+    if (this._dir) {
+        this._mac.update(result);
+    }
+
+    this.push({
+        data : new Uint8Array(sjcl.codec.bytes.fromBits(result)),
+        meta : this.meta
+    });
+};
+
+/**
+ * @see GenericWorker.flush
+ */
+AesWorker.prototype.flush = function () {
+    GenericWorker.prototype.flush.call(this);
+
+    if (this._dir) {
+        if (this._aes === null) {
+            this._createAes();
+        }
+        var macData = this._mac.digest();
+        macData = sjcl.bitArray.clamp(macData, authCodeLen * 8);
+    
+        this.push({
+            data : new Uint8Array(sjcl.codec.bytes.fromBits(macData)),
+            meta : {percent: 100}
+        });
+    }
+};
+
+/**
+ * @see GenericWorker.cleanUp
+ */
+AesWorker.prototype.cleanUp = function () {
+    GenericWorker.prototype.cleanUp.call(this);
+    this._aes = null;
+    this._aesKey = null;
+    this._mac = null;
+};
+
+/**
+ * Create the _aes object.
+ */
+AesWorker.prototype._createAes = function () {
+    if (this._dir) {
+        var salt = sjcl.random.randomWords(this._saltLen);
+        var derivedKey = sjcl.misc.pbkdf2(this._password, salt, 1000, (this._macLen + this._keyLen + passwordVerifierLen) * 8);
+        this._aesKey = sjcl.bitArray.bitSlice(derivedKey, 0, this._keyLen * 8);
+        var macKey = sjcl.bitArray.bitSlice(derivedKey, this._keyLen * 8, (this._keyLen + this._macLen) * 8);
+        var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (this._keyLen + this._macLen) * 8);
+        this._mac = new sjcl.misc.hmac(macKey);
+        
+        this.push({
+            data : new Uint8Array(sjcl.codec.bytes.fromBits(sjcl.bitArray.concat(salt, derivedPassVerifier))),
+            meta : {percent: 0}
+        });
+    }
+    
+    this._aes = new sjcl.mode.ctrGladman(new sjcl.cipher.aes(this._aesKey), [0, 0, 0, 0]);
+};
+
+exports.EncryptWorker = function (options) {
+    return new AesWorker(1, options);
+};
+
+exports.DecryptWorker = function (key) {
+    return new AesWorker(0, key);
+};
+
+/**
+ * Verify the password of file using sjcl.
+ * @param {Uint8Array} data the data to verify.
+ * @param {Object} options the options when verifying.
+ * @return {Object} the aes key and encrypted file data.
+ */
+exports.verifyPassword  = function (data, options) {
+    var password = options.password;
+    var keyLen = 8 * options.strength + 8;
+    var macLen = keyLen;
+    var saltLen = keyLen / 2;
+
+    var salt = sjcl.codec.bytes.toBits(data.subarray(0, saltLen));
+    var derivedKey = sjcl.misc.pbkdf2(password, salt, 1000, (macLen + keyLen + passwordVerifierLen) * 8);
+    var derivedPassVerifier = sjcl.bitArray.bitSlice(derivedKey, (keyLen + macLen) * 8);
+    var passVerifyValue = sjcl.codec.bytes.toBits(data.subarray(saltLen, saltLen + passwordVerifierLen));
+    if (!sjcl.bitArray.equal(passVerifyValue, derivedPassVerifier)) {
+        throw new Error("Encrypted zip: incorrect password");
+    }
+
+    return {
+        key: sjcl.bitArray.bitSlice(derivedKey, 0, keyLen * 8),
+        data: data.subarray(saltLen + passwordVerifierLen, -authCodeLen)
+    };
+};
+
+},{"./sjcl":25,"./stream/GenericWorker":30,"./utils":34}],2:[function(require,module,exports){
+'use strict';
 var utils = require('./utils');
 var support = require('./support');
 // private property
@@ -118,14 +261,14 @@ exports.decode = function(input) {
     return output;
 };
 
-},{"./support":30,"./utils":32}],2:[function(require,module,exports){
+},{"./support":32,"./utils":34}],3:[function(require,module,exports){
 'use strict';
 
 var external = require("./external");
 var DataWorker = require('./stream/DataWorker');
 var DataLengthProbe = require('./stream/DataLengthProbe');
 var Crc32Probe = require('./stream/Crc32Probe');
-var DataLengthProbe = require('./stream/DataLengthProbe');
+var aes = require('./aes');
 
 /**
  * Represent a compressed object, with everything needed to decompress it.
@@ -135,13 +278,15 @@ var DataLengthProbe = require('./stream/DataLengthProbe');
  * @param {number} crc32 the crc32 of the decompressed file.
  * @param {object} compression the type of compression, see lib/compressions.js.
  * @param {String|ArrayBuffer|Uint8Array|Buffer} data the compressed data.
+ * @param {Object} decryptOptions the compressed object decrypt options.
  */
-function CompressedObject(compressedSize, uncompressedSize, crc32, compression, data) {
+function CompressedObject(compressedSize, uncompressedSize, crc32, compression, data, decryptOptions) {
     this.compressedSize = compressedSize;
     this.uncompressedSize = uncompressedSize;
     this.crc32 = crc32;
     this.compression = compression;
     this.compressedContent = data;
+    this.decryptOptions = decryptOptions;
 }
 
 CompressedObject.prototype = {
@@ -150,9 +295,22 @@ CompressedObject.prototype = {
      * @return {GenericWorker} the worker.
      */
     getContentWorker : function () {
-        var worker = new DataWorker(external.Promise.resolve(this.compressedContent))
-        .pipe(this.compression.uncompressWorker())
-        .pipe(new DataLengthProbe("data_length"));
+        var worker;
+        if (this.decryptOptions.strength) {
+            if (!(this.decryptOptions.password && typeof this.decryptOptions.password === "string" )) {
+                throw new Error("Encrypted zip: need password");
+            }
+            var result = aes.verifyPassword(this.compressedContent, this.decryptOptions);
+
+            worker = new DataWorker(external.Promise.resolve(result.data))
+                .pipe(aes.DecryptWorker(result.key))
+                .pipe(this.compression.uncompressWorker())
+                .pipe(new DataLengthProbe("data_length"));
+        }else{
+            worker = new DataWorker(external.Promise.resolve(this.compressedContent))
+            .pipe(this.compression.uncompressWorker())
+            .pipe(new DataLengthProbe("data_length"));
+        }
 
         var that = this;
         worker.on("end", function () {
@@ -184,18 +342,27 @@ CompressedObject.prototype = {
  * @param {Object} compressionOptions the options to use when compressing.
  * @return {GenericWorker} the new worker compressing the content.
  */
-CompressedObject.createWorkerFrom = function (uncompressedWorker, compression, compressionOptions) {
-    return uncompressedWorker
-    .pipe(new Crc32Probe())
-    .pipe(new DataLengthProbe("uncompressedSize"))
-    .pipe(compression.compressWorker(compressionOptions))
-    .pipe(new DataLengthProbe("compressedSize"))
-    .withStreamInfo("compression", compression);
+CompressedObject.createWorkerFrom = function (uncompressedWorker, compression, compressionOptions, encryptOptions) {
+    if (encryptOptions.password !== null) {
+        return uncompressedWorker
+        .pipe(new DataLengthProbe("uncompressedSize"))
+        .pipe(compression.compressWorker(compressionOptions))
+        .pipe(aes.EncryptWorker(encryptOptions))
+        .pipe(new DataLengthProbe("compressedSize"))
+        .withStreamInfo("compression", compression);
+    }else{
+        return uncompressedWorker
+        .pipe(new Crc32Probe())
+        .pipe(new DataLengthProbe("uncompressedSize"))
+        .pipe(compression.compressWorker(compressionOptions))
+        .pipe(new DataLengthProbe("compressedSize"))
+        .withStreamInfo("compression", compression);
+    }
 };
 
 module.exports = CompressedObject;
 
-},{"./external":6,"./stream/Crc32Probe":25,"./stream/DataLengthProbe":26,"./stream/DataWorker":27}],3:[function(require,module,exports){
+},{"./aes":1,"./external":7,"./stream/Crc32Probe":27,"./stream/DataLengthProbe":28,"./stream/DataWorker":29}],4:[function(require,module,exports){
 'use strict';
 
 var GenericWorker = require("./stream/GenericWorker");
@@ -211,7 +378,7 @@ exports.STORE = {
 };
 exports.DEFLATE = require('./flate');
 
-},{"./flate":7,"./stream/GenericWorker":28}],4:[function(require,module,exports){
+},{"./flate":8,"./stream/GenericWorker":30}],5:[function(require,module,exports){
 'use strict';
 
 var utils = require('./utils');
@@ -290,7 +457,7 @@ module.exports = function crc32wrapper(input, crc) {
     }
 };
 
-},{"./utils":32}],5:[function(require,module,exports){
+},{"./utils":34}],6:[function(require,module,exports){
 'use strict';
 exports.base64 = false;
 exports.binary = false;
@@ -303,7 +470,7 @@ exports.comment = null;
 exports.unixPermissions = null;
 exports.dosPermissions = null;
 
-},{}],6:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 /* global Promise */
 'use strict';
 
@@ -324,7 +491,7 @@ module.exports = {
     Promise: ES6Promise
 };
 
-},{"lie":37}],7:[function(require,module,exports){
+},{"lie":39}],8:[function(require,module,exports){
 'use strict';
 var USE_TYPEDARRAY = (typeof Uint8Array !== 'undefined') && (typeof Uint16Array !== 'undefined') && (typeof Uint32Array !== 'undefined');
 
@@ -411,7 +578,7 @@ exports.uncompressWorker = function () {
     return new FlateWorker("Inflate", {});
 };
 
-},{"./stream/GenericWorker":28,"./utils":32,"pako":38}],8:[function(require,module,exports){
+},{"./stream/GenericWorker":30,"./utils":34,"pako":40}],9:[function(require,module,exports){
 'use strict';
 
 var utils = require('../utils');
@@ -509,7 +676,9 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
     unicodePathExtraField = "",
     unicodeCommentExtraField = "",
     dir = file.dir,
-    date = file.date;
+    date = file.date,
+    encryptOptions = streamInfo.file.encryptOptions,
+    isEncrypt = encryptOptions.password !== null;
 
 
     var dataInfo = {
@@ -527,6 +696,9 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
     }
 
     var bitflag = 0;
+    if (isEncrypt) {
+        bitflag |= 0x0001;
+    }
     if (streamedContent) {
         // Bit 3: the sizes/crc32 are set to zero in the local header.
         // The correct values are put in the data descriptor immediately
@@ -545,7 +717,7 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
         // dos or unix, we set the dos dir flag
         extFileAttr |= 0x00010;
     }
-    if(platform === "UNIX") {
+    if (platform === "UNIX") {
         versionMadeBy = 0x031E; // UNIX, version 3.0
         extFileAttr |= generateUnixExternalFileAttr(file.unixPermissions, dir);
     } else { // DOS or other, fallback to DOS
@@ -597,7 +769,7 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
             unicodePathExtraField;
     }
 
-    if(useUTF8ForComment) {
+    if (useUTF8ForComment) {
 
         unicodeCommentExtraField =
             // Version
@@ -616,14 +788,31 @@ var generateZipParts = function(streamInfo, streamedContent, streamingEnded, off
             unicodeCommentExtraField;
     }
 
+    if (isEncrypt) {
+        extraFields += "\x01" + String.fromCharCode(0x99);
+        extraFields += "\x07\x00";
+        extraFields += "\x02\x00";
+        extraFields += "AE";
+        extraFields += String.fromCharCode(encryptOptions.strength);
+        extraFields += compression.magic;
+    }
+
     var header = "";
 
     // version needed to extract
-    header += "\x0A\x00";
+    if (isEncrypt) {
+        header += "\x33\x00";
+    } else {
+        header += "\x0A\x00";
+    }
     // general purpose bit flag
     header += decToHex(bitflag, 2);
     // compression method
-    header += compression.magic;
+    if (isEncrypt) {
+        header += "\x63\x00";
+    } else {
+        header += compression.magic;
+    }
     // last mod file time
     header += decToHex(dosTime, 2);
     // last mod file date
@@ -762,8 +951,6 @@ function ZipFileWorker(streamFiles, comment, platform, encodeFileName) {
     // Used for the emitted metadata.
     this.currentFile = null;
 
-
-
     this._sources = [];
 }
 utils.inherits(ZipFileWorker, GenericWorker);
@@ -777,7 +964,7 @@ ZipFileWorker.prototype.push = function (chunk) {
     var entriesCount = this.entriesCount;
     var remainingFiles = this._sources.length;
 
-    if(this.accumulate) {
+    if (this.accumulate) {
         this.contentBuffer.push(chunk);
     } else {
         this.bytesWritten += chunk.data.length;
@@ -822,10 +1009,10 @@ ZipFileWorker.prototype.openedSource = function (streamInfo) {
 ZipFileWorker.prototype.closedSource = function (streamInfo) {
     this.accumulate = false;
     var streamedContent = this.streamFiles && !streamInfo['file'].dir;
-    var record = generateZipParts(streamInfo, streamedContent, true, this.currentSourceOffset, this.zipPlatform, this.encodeFileName);
 
+    var record = generateZipParts(streamInfo, streamedContent, true, this.currentSourceOffset, this.zipPlatform, this.encodeFileName);
     this.dirRecords.push(record.dirRecord);
-    if(streamedContent) {
+    if (streamedContent) {
         // after the streamed file, we put data descriptors
         this.push({
             data : generateDataDescriptors(streamInfo),
@@ -953,11 +1140,12 @@ ZipFileWorker.prototype.lock = function () {
 
 module.exports = ZipFileWorker;
 
-},{"../crc32":4,"../signature":23,"../stream/GenericWorker":28,"../utf8":31,"../utils":32}],9:[function(require,module,exports){
+},{"../crc32":5,"../signature":24,"../stream/GenericWorker":30,"../utf8":33,"../utils":34}],10:[function(require,module,exports){
 'use strict';
 
 var compressions = require('../compressions');
 var ZipFileWorker = require('./ZipFileWorker');
+var utils = require('../utils');
 
 /**
  * Find the compression to use.
@@ -982,7 +1170,10 @@ var getCompression = function (fileCompression, zipCompression) {
  * @param {String} comment the comment to use.
  */
 exports.generateWorker = function (zip, options, comment) {
-
+    var encryptOptions = {
+        password: options.password,
+        strength: options.encryptStrength
+    };
     var zipFileWorker = new ZipFileWorker(options.streamFiles, comment, options.platform, options.encodeFileName);
     var entriesCount = 0;
     try {
@@ -992,15 +1183,24 @@ exports.generateWorker = function (zip, options, comment) {
             var compression = getCompression(file.options.compression, options.compression);
             var compressionOptions = file.options.compressionOptions || options.compressionOptions || {};
             var dir = file.dir, date = file.date;
+            var fileEncryptOptions = utils.extend(file.encryptOptions || {}, encryptOptions);
+            if (!fileEncryptOptions.password) {
+                fileEncryptOptions.password = null;
+            } else if (typeof fileEncryptOptions.password !== "string") {
+                throw new Error("Password is not a valid string.");
+            }else{
+                fileEncryptOptions.strength =  fileEncryptOptions.strength || 3;
+            }
 
-            file._compressWorker(compression, compressionOptions)
+            file._compressWorker(compression, compressionOptions, fileEncryptOptions)
             .withStreamInfo("file", {
                 name : relativePath,
                 dir : dir,
                 date : date,
                 comment : file.comment || "",
                 unixPermissions : file.unixPermissions,
-                dosPermissions : file.dosPermissions
+                dosPermissions : file.dosPermissions,
+                encryptOptions : fileEncryptOptions
             })
             .pipe(zipFileWorker);
         });
@@ -1012,7 +1212,7 @@ exports.generateWorker = function (zip, options, comment) {
     return zipFileWorker;
 };
 
-},{"../compressions":3,"./ZipFileWorker":8}],10:[function(require,module,exports){
+},{"../compressions":4,"../utils":34,"./ZipFileWorker":9}],11:[function(require,module,exports){
 'use strict';
 
 /**
@@ -1066,7 +1266,7 @@ JSZip.loadAsync = function (content, options) {
 JSZip.external = require("./external");
 module.exports = JSZip;
 
-},{"./defaults":5,"./external":6,"./load":11,"./object":15,"./support":30}],11:[function(require,module,exports){
+},{"./defaults":6,"./external":7,"./load":12,"./object":16,"./support":32}],12:[function(require,module,exports){
 'use strict';
 var utils = require('./utils');
 var external = require("./external");
@@ -1083,6 +1283,10 @@ var nodejsUtils = require("./nodejsUtils");
  */
 function checkEntryCRC32(zipEntry) {
     return new external.Promise(function (resolve, reject) {
+        if (zipEntry.options.aes.version === 2) {
+            reject(new Error("Encrypted zip : no CRC32 stored"));
+            return;
+        }
         var worker = zipEntry.decompressed.getContentWorker().pipe(new Crc32Probe());
         worker.on("error", function (e) {
             reject(e);
@@ -1102,6 +1306,7 @@ module.exports = function(data, options) {
     var zip = this;
     options = utils.extend(options || {}, {
         base64: false,
+        password: null,
         checkCRC32: false,
         optimizedBinaryString: false,
         createFolders: false,
@@ -1150,7 +1355,7 @@ module.exports = function(data, options) {
     });
 };
 
-},{"./external":6,"./nodejsUtils":14,"./stream/Crc32Probe":25,"./utf8":31,"./utils":32,"./zipEntries":33}],12:[function(require,module,exports){
+},{"./external":7,"./nodejsUtils":15,"./stream/Crc32Probe":27,"./utf8":33,"./utils":34,"./zipEntries":35}],13:[function(require,module,exports){
 "use strict";
 
 var utils = require('../utils');
@@ -1226,7 +1431,7 @@ NodejsStreamInputAdapter.prototype.resume = function () {
 
 module.exports = NodejsStreamInputAdapter;
 
-},{"../stream/GenericWorker":28,"../utils":32}],13:[function(require,module,exports){
+},{"../stream/GenericWorker":30,"../utils":34}],14:[function(require,module,exports){
 'use strict';
 
 var Readable = require('readable-stream').Readable;
@@ -1270,7 +1475,7 @@ NodejsStreamOutputAdapter.prototype._read = function() {
 
 module.exports = NodejsStreamOutputAdapter;
 
-},{"../utils":32,"readable-stream":16}],14:[function(require,module,exports){
+},{"../utils":34,"readable-stream":17}],15:[function(require,module,exports){
 'use strict';
 
 module.exports = {
@@ -1329,7 +1534,7 @@ module.exports = {
     }
 };
 
-},{}],15:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 'use strict';
 var utf8 = require('./utf8');
 var utils = require('./utils');
@@ -1650,54 +1855,56 @@ var out = {
      * - type, "base64" by default. Values are : string, base64, uint8array, arraybuffer, blob.
      * @return {StreamHelper} the streamed zip file.
      */
-    generateInternalStream: function(options) {
-      var worker, opts = {};
-      try {
-          opts = utils.extend(options || {}, {
-              streamFiles: false,
-              compression: "STORE",
-              compressionOptions : null,
-              type: "",
-              platform: "DOS",
-              comment: null,
-              mimeType: 'application/zip',
-              encodeFileName: utf8.utf8encode
-          });
+    generateInternalStream: function (options) {
+        var worker, opts = {};
+        try {
+            opts = utils.extend(options || {}, {
+                streamFiles: false,
+                compression: "STORE",
+                compressionOptions: null,
+                password: null,
+                encryptStrength: null,
+                type: "",
+                platform: "DOS",
+                comment: null,
+                mimeType: 'application/zip',
+                encodeFileName: utf8.utf8encode
+            });
 
-          opts.type = opts.type.toLowerCase();
-          opts.compression = opts.compression.toUpperCase();
+            opts.type = opts.type.toLowerCase();
+            opts.compression = opts.compression.toUpperCase();
 
-          // "binarystring" is preferred but the internals use "string".
-          if(opts.type === "binarystring") {
-            opts.type = "string";
-          }
+            // "binarystring" is preferred but the internals use "string".
+            if (opts.type === "binarystring") {
+                opts.type = "string";
+            }
 
-          if (!opts.type) {
-            throw new Error("No output type specified.");
-          }
+            if (!opts.type) {
+                throw new Error("No output type specified.");
+            }
 
-          utils.checkSupport(opts.type);
+            utils.checkSupport(opts.type);
 
-          // accept nodejs `process.platform`
-          if(
-              opts.platform === 'darwin' ||
-              opts.platform === 'freebsd' ||
-              opts.platform === 'linux' ||
-              opts.platform === 'sunos'
-          ) {
-              opts.platform = "UNIX";
-          }
-          if (opts.platform === 'win32') {
-              opts.platform = "DOS";
-          }
+            // accept nodejs `process.platform`
+            if (
+                opts.platform === 'darwin' ||
+                opts.platform === 'freebsd' ||
+                opts.platform === 'linux' ||
+                opts.platform === 'sunos'
+            ) {
+                opts.platform = "UNIX";
+            }
+            if (opts.platform === 'win32') {
+                opts.platform = "DOS";
+            }
 
-          var comment = opts.comment || this.comment || "";
-          worker = generate.generateWorker(this, opts, comment);
-      } catch (e) {
-        worker = new GenericWorker("error");
-        worker.error(e);
-      }
-      return new StreamHelper(worker, opts.type || "string", opts.mimeType);
+            var comment = opts.comment || this.comment || "";
+            worker = generate.generateWorker(this, opts, comment);
+        } catch (e) {
+            worker = new GenericWorker("error");
+            worker.error(e);
+        }
+        return new StreamHelper(worker, opts.type || "string", opts.mimeType);
     },
     /**
      * Generate the complete zip file asynchronously.
@@ -1720,7 +1927,7 @@ var out = {
 };
 module.exports = out;
 
-},{"./compressedObject":2,"./defaults":5,"./generate":9,"./nodejs/NodejsStreamInputAdapter":12,"./nodejsUtils":14,"./stream/GenericWorker":28,"./stream/StreamHelper":29,"./utf8":31,"./utils":32,"./zipObject":35}],16:[function(require,module,exports){
+},{"./compressedObject":3,"./defaults":6,"./generate":10,"./nodejs/NodejsStreamInputAdapter":13,"./nodejsUtils":15,"./stream/GenericWorker":30,"./stream/StreamHelper":31,"./utf8":33,"./utils":34,"./zipObject":37}],17:[function(require,module,exports){
 /*
  * This file is used by module bundlers (browserify/webpack/etc) when
  * including a stream implementation. We use "readable-stream" to get a
@@ -1731,7 +1938,7 @@ module.exports = out;
  */
 module.exports = require("stream");
 
-},{"stream":undefined}],17:[function(require,module,exports){
+},{"stream":undefined}],18:[function(require,module,exports){
 'use strict';
 var DataReader = require('./DataReader');
 var utils = require('../utils');
@@ -1790,7 +1997,7 @@ ArrayReader.prototype.readData = function(size) {
 };
 module.exports = ArrayReader;
 
-},{"../utils":32,"./DataReader":18}],18:[function(require,module,exports){
+},{"../utils":34,"./DataReader":19}],19:[function(require,module,exports){
 'use strict';
 var utils = require('../utils');
 
@@ -1908,7 +2115,7 @@ DataReader.prototype = {
 };
 module.exports = DataReader;
 
-},{"../utils":32}],19:[function(require,module,exports){
+},{"../utils":34}],20:[function(require,module,exports){
 'use strict';
 var Uint8ArrayReader = require('./Uint8ArrayReader');
 var utils = require('../utils');
@@ -1929,7 +2136,7 @@ NodeBufferReader.prototype.readData = function(size) {
 };
 module.exports = NodeBufferReader;
 
-},{"../utils":32,"./Uint8ArrayReader":21}],20:[function(require,module,exports){
+},{"../utils":34,"./Uint8ArrayReader":22}],21:[function(require,module,exports){
 'use strict';
 var DataReader = require('./DataReader');
 var utils = require('../utils');
@@ -1969,7 +2176,7 @@ StringReader.prototype.readData = function(size) {
 };
 module.exports = StringReader;
 
-},{"../utils":32,"./DataReader":18}],21:[function(require,module,exports){
+},{"../utils":34,"./DataReader":19}],22:[function(require,module,exports){
 'use strict';
 var ArrayReader = require('./ArrayReader');
 var utils = require('../utils');
@@ -1993,7 +2200,7 @@ Uint8ArrayReader.prototype.readData = function(size) {
 };
 module.exports = Uint8ArrayReader;
 
-},{"../utils":32,"./ArrayReader":17}],22:[function(require,module,exports){
+},{"../utils":34,"./ArrayReader":18}],23:[function(require,module,exports){
 'use strict';
 
 var utils = require('../utils');
@@ -2023,7 +2230,7 @@ module.exports = function (data) {
     return new ArrayReader(utils.transformTo("array", data));
 };
 
-},{"../support":30,"../utils":32,"./ArrayReader":17,"./NodeBufferReader":19,"./StringReader":20,"./Uint8ArrayReader":21}],23:[function(require,module,exports){
+},{"../support":32,"../utils":34,"./ArrayReader":18,"./NodeBufferReader":20,"./StringReader":21,"./Uint8ArrayReader":22}],24:[function(require,module,exports){
 'use strict';
 exports.LOCAL_FILE_HEADER = "PK\x03\x04";
 exports.CENTRAL_FILE_HEADER = "PK\x01\x02";
@@ -2032,7 +2239,1066 @@ exports.ZIP64_CENTRAL_DIRECTORY_LOCATOR = "PK\x06\x07";
 exports.ZIP64_CENTRAL_DIRECTORY_END = "PK\x06\x06";
 exports.DATA_DESCRIPTOR = "PK\x07\x08";
 
-},{}],24:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
+(function (global){
+/** @fileOverview Javascript cryptography implementation.
+ *
+ * Crush to remove comments, shorten variable names and
+ * generally reduce transmission size.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+"use strict";
+/*jslint indent: 2, bitwise: false, nomen: false, plusplus: false, white: false, regexp: false */
+/*global document, window, escape, unescape, module, require, Uint32Array */
+
+/**
+ * The Stanford Javascript Crypto Library, top-level namespace.
+ * @namespace
+ */
+var sjcl = {
+    /**
+     * Symmetric ciphers.
+     * @namespace
+     */
+    cipher: {},
+
+    /**
+     * Hash functions.
+     * @namespace
+     */
+    hash: {},
+
+    /**
+     * Key exchange functions.  Right now only SRP is implemented.
+     * @namespace
+     */
+    keyexchange: {},
+
+    /**
+     * Cipher modes of operation.
+     * @namespace
+     */
+    mode: {},
+
+    /**
+     * Miscellaneous.  HMAC and PBKDF2.
+     * @namespace
+     */
+    misc: {},
+
+    /**
+     * Bit array encoders and decoders.
+     * @namespace
+     *
+     * @description
+     * The members of this namespace are functions which translate between
+     * SJCL's bitArrays and other objects (usually strings).  Because it
+     * isn't always clear which direction is encoding and which is decoding,
+     * the method names are "fromBits" and "toBits".
+     */
+    codec: {},
+
+    /**
+     * Exceptions.
+     * @namespace
+     */
+    exception: {
+        /**
+         * Ciphertext is corrupt.
+         * @constructor
+         */
+        corrupt: function (message) {
+            this.toString = function () { return "CORRUPT: " + this.message; };
+            this.message = message;
+        },
+
+        /**
+         * Invalid parameter.
+         * @constructor
+         */
+        invalid: function (message) {
+            this.toString = function () { return "INVALID: " + this.message; };
+            this.message = message;
+        },
+
+        /**
+         * Bug or missing feature in SJCL.
+         * @constructor
+         */
+        bug: function (message) {
+            this.toString = function () { return "BUG: " + this.message; };
+            this.message = message;
+        },
+
+        /**
+         * Something isn't ready.
+         * @constructor
+         */
+        notReady: function (message) {
+            this.toString = function () { return "NOT READY: " + this.message; };
+            this.message = message;
+        }
+    }
+};
+
+/** @fileOverview Arrays of bits, encoded as arrays of Numbers.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/**
+ * Arrays of bits, encoded as arrays of Numbers.
+ * @namespace
+ * @description
+ * <p>
+ * These objects are the currency accepted by SJCL's crypto functions.
+ * </p>
+ *
+ * <p>
+ * Most of our crypto primitives operate on arrays of 4-byte words internally,
+ * but many of them can take arguments that are not a multiple of 4 bytes.
+ * This library encodes arrays of bits (whose size need not be a multiple of 8
+ * bits) as arrays of 32-bit words.  The bits are packed, big-endian, into an
+ * array of words, 32 bits at a time.  Since the words are double-precision
+ * floating point numbers, they fit some extra data.  We use this (in a private,
+ * possibly-changing manner) to encode the number of bits actually  present
+ * in the last word of the array.
+ * </p>
+ *
+ * <p>
+ * Because bitwise ops clear this out-of-band data, these arrays can be passed
+ * to ciphers like AES which want arrays of words.
+ * </p>
+ */
+sjcl.bitArray = {
+    /**
+     * Array slices in units of bits.
+     * @param {bitArray} a The array to slice.
+     * @param {Number} bstart The offset to the start of the slice, in bits.
+     * @param {Number} bend The offset to the end of the slice, in bits.  If this is undefined,
+     * slice until the end of the array.
+     * @return {bitArray} The requested slice.
+     */
+    bitSlice: function (a, bstart, bend) {
+        a = sjcl.bitArray._shiftRight(a.slice(bstart / 32), 32 - (bstart & 31)).slice(1);
+        return (bend === undefined) ? a : sjcl.bitArray.clamp(a, bend - bstart);
+    },
+
+    /**
+     * Concatenate two bit arrays.
+     * @param {bitArray} a1 The first array.
+     * @param {bitArray} a2 The second array.
+     * @return {bitArray} The concatenation of a1 and a2.
+     */
+    concat: function (a1, a2) {
+        if (a1.length === 0 || a2.length === 0) {
+            return a1.concat(a2);
+        }
+
+        var last = a1[a1.length - 1], shift = sjcl.bitArray.getPartial(last);
+        if (shift === 32) {
+            return a1.concat(a2);
+        } else {
+            return sjcl.bitArray._shiftRight(a2, shift, last | 0, a1.slice(0, a1.length - 1));
+        }
+    },
+
+    /**
+     * Find the length of an array of bits.
+     * @param {bitArray} a The array.
+     * @return {Number} The length of a, in bits.
+     */
+    bitLength: function (a) {
+        var l = a.length, x;
+        if (l === 0) { return 0; }
+        x = a[l - 1];
+        return (l - 1) * 32 + sjcl.bitArray.getPartial(x);
+    },
+
+    /**
+     * Truncate an array.
+     * @param {bitArray} a The array.
+     * @param {Number} len The length to truncate to, in bits.
+     * @return {bitArray} A new array, truncated to len bits.
+     */
+    clamp: function (a, len) {
+        if (a.length * 32 < len) { return a; }
+        a = a.slice(0, Math.ceil(len / 32));
+        var l = a.length;
+        len = len & 31;
+        if (l > 0 && len) {
+            a[l - 1] = sjcl.bitArray.partial(len, a[l - 1] & 0x80000000 >> (len - 1), 1);
+        }
+        return a;
+    },
+
+    /**
+     * Make a partial word for a bit array.
+     * @param {Number} len The number of bits in the word.
+     * @param {Number} x The bits.
+     * @param {Number} [_end=0] Pass 1 if x has already been shifted to the high side.
+     * @return {Number} The partial word.
+     */
+    partial: function (len, x, _end) {
+        if (len === 32) { return x; }
+        return (_end ? x | 0 : x << (32 - len)) + len * 0x10000000000;
+    },
+
+    /**
+     * Get the number of bits used by a partial word.
+     * @param {Number} x The partial word.
+     * @return {Number} The number of bits used by the partial word.
+     */
+    getPartial: function (x) {
+        return Math.round(x / 0x10000000000) || 32;
+    },
+
+    /**
+     * Compare two arrays for equality in a predictable amount of time.
+     * @param {bitArray} a The first array.
+     * @param {bitArray} b The second array.
+     * @return {boolean} true if a == b; false otherwise.
+     */
+    equal: function (a, b) {
+        if (sjcl.bitArray.bitLength(a) !== sjcl.bitArray.bitLength(b)) {
+            return false;
+        }
+        var x = 0, i;
+        for (i = 0; i < a.length; i++) {
+            x |= a[i] ^ b[i];
+        }
+        return (x === 0);
+    },
+
+    /** Shift an array right.
+     * @param {bitArray} a The array to shift.
+     * @param {Number} shift The number of bits to shift.
+     * @param {Number} [carry=0] A byte to carry in
+     * @param {bitArray} [out=[]] An array to prepend to the output.
+     * @private
+     */
+    _shiftRight: function (a, shift, carry, out) {
+        var i, last2 = 0, shift2;
+        if (out === undefined) { out = []; }
+
+        for (; shift >= 32; shift -= 32) {
+            out.push(carry);
+            carry = 0;
+        }
+        if (shift === 0) {
+            return out.concat(a);
+        }
+
+        for (i = 0; i < a.length; i++) {
+            out.push(carry | a[i] >>> shift);
+            carry = a[i] << (32 - shift);
+        }
+        last2 = a.length ? a[a.length - 1] : 0;
+        shift2 = sjcl.bitArray.getPartial(last2);
+        out.push(sjcl.bitArray.partial(shift + shift2 & 31, (shift + shift2 > 32) ? carry : out.pop(), 1));
+        return out;
+    }
+};
+
+/** @fileOverview Bit array codec implementations.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/**
+ * Arrays of bytes
+ * @namespace
+ */
+sjcl.codec.bytes = {
+    /** Convert from a bitArray to an array of bytes. */
+    fromBits: function (arr) {
+        var out = [], bl = sjcl.bitArray.bitLength(arr), i, tmp;
+        for (i = 0; i < bl / 8; i++) {
+            if ((i & 3) === 0) {
+                tmp = arr[i / 4];
+            }
+            out.push(tmp >>> 24);
+            tmp <<= 8;
+        }
+        return out;
+    },
+    /** Convert from an array of bytes to a bitArray. */
+    toBits: function (bytes) {
+        var out = [], i, tmp = 0;
+        for (i = 0; i < bytes.length; i++) {
+            tmp = tmp << 8 | bytes[i];
+            if ((i & 3) === 3) {
+                out.push(tmp);
+                tmp = 0;
+            }
+        }
+        if (i & 3) {
+            out.push(sjcl.bitArray.partial(8 * (i & 3), tmp));
+        }
+        return out;
+    }
+};
+
+/** @fileOverview Bit array codec implementations.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/**
+ * UTF-8 strings
+ * @namespace
+ */
+sjcl.codec.utf8String = {
+    /** Convert from a bitArray to a UTF-8 string. */
+    fromBits: function (arr) {
+        var out = "", bl = sjcl.bitArray.bitLength(arr), i, tmp;
+        for (i = 0; i < bl / 8; i++) {
+            if ((i & 3) === 0) {
+                tmp = arr[i / 4];
+            }
+            out += String.fromCharCode(tmp >>> 8 >>> 8 >>> 8);
+            tmp <<= 8;
+        }
+        return decodeURIComponent(escape(out));
+    },
+
+    /** Convert from a UTF-8 string to a bitArray. */
+    toBits: function (str) {
+        str = unescape(encodeURIComponent(str));
+        var out = [], i, tmp = 0;
+        for (i = 0; i < str.length; i++) {
+            tmp = tmp << 8 | str.charCodeAt(i);
+            if ((i & 3) === 3) {
+                out.push(tmp);
+                tmp = 0;
+            }
+        }
+        if (i & 3) {
+            out.push(sjcl.bitArray.partial(8 * (i & 3), tmp));
+        }
+        return out;
+    }
+};
+
+/** @fileOverview Javascript SHA-1 implementation.
+ *
+ * Based on the implementation in RFC 3174, method 1, and on the SJCL
+ * SHA-256 implementation.
+ *
+ * @author Quinn Slack
+ */
+
+/**
+ * Context for a SHA-1 operation in progress.
+ * @constructor
+ */
+sjcl.hash.sha1 = function (hash) {
+    if (hash) {
+        this._h = hash._h.slice(0);
+        this._buffer = hash._buffer.slice(0);
+        this._length = hash._length;
+    } else {
+        this.reset();
+    }
+};
+
+/**
+ * Hash a string or an array of words.
+ * @static
+ * @param {bitArray|String} data the data to hash.
+ * @return {bitArray} The hash value, an array of 5 big-endian words.
+ */
+sjcl.hash.sha1.hash = function (data) {
+    return (new sjcl.hash.sha1()).update(data).finalize();
+};
+
+sjcl.hash.sha1.prototype = {
+    /**
+     * The hash's block size, in bits.
+     * @constant
+     */
+    blockSize: 512,
+
+    /**
+     * Reset the hash state.
+     * @return this
+     */
+    reset: function () {
+        this._h = this._init.slice(0);
+        this._buffer = [];
+        this._length = 0;
+        return this;
+    },
+
+    /**
+     * Input several words to the hash.
+     * @param {bitArray|String} data the data to hash.
+     * @return this
+     */
+    update: function (data) {
+        if (typeof data === "string") {
+            data = sjcl.codec.utf8String.toBits(data);
+        }
+        var i, b = this._buffer = sjcl.bitArray.concat(this._buffer, data),
+            ol = this._length,
+            nl = this._length = ol + sjcl.bitArray.bitLength(data);
+        if (nl > 9007199254740991) {
+            throw new sjcl.exception.invalid("Cannot hash more than 2^53 - 1 bits");
+        }
+
+        if (typeof Uint32Array !== 'undefined') {
+            var c = new Uint32Array(b);
+            var j = 0;
+            for (i = this.blockSize + ol - ((this.blockSize + ol) & (this.blockSize - 1)); i <= nl;
+                i += this.blockSize) {
+                this._block(c.subarray(16 * j, 16 * (j + 1)));
+                j += 1;
+            }
+            b.splice(0, 16 * j);
+        } else {
+            for (i = this.blockSize + ol - ((this.blockSize + ol) & (this.blockSize - 1)); i <= nl;
+                i += this.blockSize) {
+                this._block(b.splice(0, 16));
+            }
+        }
+        return this;
+    },
+
+    /**
+     * Complete hashing and output the hash value.
+     * @return {bitArray} The hash value, an array of 5 big-endian words. TODO
+     */
+    finalize: function () {
+        var i, b = this._buffer, h = this._h;
+
+        // Round out and push the buffer
+        b = sjcl.bitArray.concat(b, [sjcl.bitArray.partial(1, 1)]);
+        // Round out the buffer to a multiple of 16 words, less the 2 length words.
+        for (i = b.length + 2; i & 15; i++) {
+            b.push(0);
+        }
+
+        // append the length
+        b.push(Math.floor(this._length / 0x100000000));
+        b.push(this._length | 0);
+
+        while (b.length) {
+            this._block(b.splice(0, 16));
+        }
+
+        this.reset();
+        return h;
+    },
+
+    /**
+     * The SHA-1 initialization vector.
+     * @private
+     */
+    _init: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+
+    /**
+     * The SHA-1 hash key.
+     * @private
+     */
+    _key: [0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6],
+
+    /**
+     * The SHA-1 logical functions f(0), f(1), ..., f(79).
+     * @private
+     */
+    _f: function (t, b, c, d) {
+        if (t <= 19) {
+            return (b & c) | (~b & d);
+        } else if (t <= 39) {
+            return b ^ c ^ d;
+        } else if (t <= 59) {
+            return (b & c) | (b & d) | (c & d);
+        } else if (t <= 79) {
+            return b ^ c ^ d;
+        }
+    },
+
+    /**
+     * Circular left-shift operator.
+     * @private
+     */
+    _S: function (n, x) {
+        return (x << n) | (x >>> 32 - n);
+    },
+
+    /**
+     * Perform one cycle of SHA-1.
+     * @param {Uint32Array|bitArray} words one block of words.
+     * @private
+     */
+    _block: function (words) {
+        var t, tmp, a, b, c, d, e,
+            h = this._h;
+        var w;
+        if (typeof Uint32Array !== 'undefined') {
+            // When words is passed to _block, it has 16 elements. SHA1 _block
+            // function extends words with new elements (at the end there are 80 elements). 
+            // The problem is that if we use Uint32Array instead of Array, 
+            // the length of Uint32Array cannot be changed. Thus, we replace words with a 
+            // normal Array here.
+            w = Array(80); // do not use Uint32Array here as the instantiation is slower
+            for (var j = 0; j < 16; j++) {
+                w[j] = words[j];
+            }
+        } else {
+            w = words;
+        }
+
+        a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4];
+
+        for (t = 0; t <= 79; t++) {
+            if (t >= 16) {
+                w[t] = this._S(1, w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]);
+            }
+            tmp = (this._S(5, a) + this._f(t, b, c, d) + e + w[t] +
+                this._key[Math.floor(t / 20)]) | 0;
+            e = d;
+            d = c;
+            c = this._S(30, b);
+            b = a;
+            a = tmp;
+        }
+
+        h[0] = (h[0] + a) | 0;
+        h[1] = (h[1] + b) | 0;
+        h[2] = (h[2] + c) | 0;
+        h[3] = (h[3] + d) | 0;
+        h[4] = (h[4] + e) | 0;
+    }
+};
+
+/** @fileOverview Low-level AES implementation.
+ *
+ * This file contains a low-level implementation of AES, optimized for
+ * size and for efficiency on several browsers.  It is based on
+ * OpenSSL's aes_core.c, a public-domain implementation by Vincent
+ * Rijmen, Antoon Bosselaers and Paulo Barreto.
+ *
+ * An older version of this implementation is available in the public
+ * domain, but this one is (c) Emily Stark, Mike Hamburg, Dan Boneh,
+ * Stanford University 2008-2010 and BSD-licensed for liability
+ * reasons.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/**
+ * Schedule out an AES key for both encryption and decryption.  This
+ * is a low-level class.  Use a cipher mode to do bulk encryption.
+ *
+ * @constructor
+ * @param {Array} key The key as an array of 4, 6 or 8 words.
+ */
+sjcl.cipher.aes = function (key) {
+    if (!this._tables[0][0][0]) {
+        this._precompute();
+    }
+
+    var i, j, tmp,
+        encKey, decKey,
+        sbox = this._tables[0][4], decTable = this._tables[1],
+        keyLen = key.length, rcon = 1;
+
+    if (keyLen !== 4 && keyLen !== 6 && keyLen !== 8) {
+        throw new sjcl.exception.invalid("invalid aes key size");
+    }
+
+    this._key = [encKey = key.slice(0), decKey = []];
+
+    // schedule encryption keys
+    for (i = keyLen; i < 4 * keyLen + 28; i++) {
+        tmp = encKey[i - 1];
+
+        // apply sbox
+        if (i % keyLen === 0 || (keyLen === 8 && i % keyLen === 4)) {
+            tmp = sbox[tmp >>> 24] << 24 ^ sbox[tmp >> 16 & 255] << 16 ^ sbox[tmp >> 8 & 255] << 8 ^ sbox[tmp & 255];
+
+            // shift rows and add rcon
+            if (i % keyLen === 0) {
+                tmp = tmp << 8 ^ tmp >>> 24 ^ rcon << 24;
+                rcon = rcon << 1 ^ (rcon >> 7) * 283;
+            }
+        }
+
+        encKey[i] = encKey[i - keyLen] ^ tmp;
+    }
+
+    // schedule decryption keys
+    for (j = 0; i; j++, i--) {
+        tmp = encKey[j & 3 ? i : i - 4];
+        if (i <= 4 || j < 4) {
+            decKey[j] = tmp;
+        } else {
+            decKey[j] = decTable[0][sbox[tmp >>> 24]] ^
+                decTable[1][sbox[tmp >> 16 & 255]] ^
+                decTable[2][sbox[tmp >> 8 & 255]] ^
+                decTable[3][sbox[tmp & 255]];
+        }
+    }
+};
+
+sjcl.cipher.aes.prototype = {
+    // public
+    /* Something like this might appear here eventually
+    name: "AES",
+    blockSize: 4,
+    keySizes: [4,6,8],
+    */
+
+    /**
+     * Encrypt an array of 4 big-endian words.
+     * @param {Array} data The plaintext.
+     * @return {Array} The ciphertext.
+     */
+    encrypt: function (data) { return this._crypt(data, 0); },
+
+    /**
+     * Decrypt an array of 4 big-endian words.
+     * @param {Array} data The ciphertext.
+     * @return {Array} The plaintext.
+     */
+    decrypt: function (data) { return this._crypt(data, 1); },
+
+    /**
+     * The expanded S-box and inverse S-box tables.  These will be computed
+     * on the client so that we don't have to send them down the wire.
+     *
+     * There are two tables, _tables[0] is for encryption and
+     * _tables[1] is for decryption.
+     *
+     * The first 4 sub-tables are the expanded S-box with MixColumns.  The
+     * last (_tables[01][4]) is the S-box itself.
+     *
+     * @private
+     */
+    _tables: [[[], [], [], [], []], [[], [], [], [], []]],
+
+    /**
+     * Expand the S-box tables.
+     *
+     * @private
+     */
+    _precompute: function () {
+        var encTable = this._tables[0], decTable = this._tables[1],
+            sbox = encTable[4], sboxInv = decTable[4],
+            i, x, xInv, d = [], th = [], x2, x4, x8, s, tEnc, tDec;
+
+        // Compute double and third tables
+        for (i = 0; i < 256; i++) {
+            th[(d[i] = i << 1 ^ (i >> 7) * 283) ^ i] = i;
+        }
+
+        for (x = xInv = 0; !sbox[x]; x ^= x2 || 1, xInv = th[xInv] || 1) {
+            // Compute sbox
+            s = xInv ^ xInv << 1 ^ xInv << 2 ^ xInv << 3 ^ xInv << 4;
+            s = s >> 8 ^ s & 255 ^ 99;
+            sbox[x] = s;
+            sboxInv[s] = x;
+
+            // Compute MixColumns
+            x8 = d[x4 = d[x2 = d[x]]];
+            tDec = x8 * 0x1010101 ^ x4 * 0x10001 ^ x2 * 0x101 ^ x * 0x1010100;
+            tEnc = d[s] * 0x101 ^ s * 0x1010100;
+
+            for (i = 0; i < 4; i++) {
+                encTable[i][x] = tEnc = tEnc << 24 ^ tEnc >>> 8;
+                decTable[i][s] = tDec = tDec << 24 ^ tDec >>> 8;
+            }
+        }
+
+        // Compactify.  Considerable speedup on Firefox.
+        for (i = 0; i < 5; i++) {
+            encTable[i] = encTable[i].slice(0);
+            decTable[i] = decTable[i].slice(0);
+        }
+    },
+
+    /**
+     * Encryption and decryption core.
+     * @param {Array} input Four words to be encrypted or decrypted.
+     * @param dir The direction, 0 for encrypt and 1 for decrypt.
+     * @return {Array} The four encrypted or decrypted words.
+     * @private
+     */
+    _crypt: function (input, dir) {
+        if (input.length !== 4) {
+            throw new sjcl.exception.invalid("invalid aes block size");
+        }
+
+        var key = this._key[dir],
+            // state variables a,b,c,d are loaded with pre-whitened data
+            a = input[0] ^ key[0],
+            b = input[dir ? 3 : 1] ^ key[1],
+            c = input[2] ^ key[2],
+            d = input[dir ? 1 : 3] ^ key[3],
+            a2, b2, c2,
+
+            nInnerRounds = key.length / 4 - 2,
+            i,
+            kIndex = 4,
+            out = [0, 0, 0, 0],
+            table = this._tables[dir],
+
+            // load up the tables
+            t0 = table[0],
+            t1 = table[1],
+            t2 = table[2],
+            t3 = table[3],
+            sbox = table[4];
+
+        // Inner rounds.  Cribbed from OpenSSL.
+        for (i = 0; i < nInnerRounds; i++) {
+            a2 = t0[a >>> 24] ^ t1[b >> 16 & 255] ^ t2[c >> 8 & 255] ^ t3[d & 255] ^ key[kIndex];
+            b2 = t0[b >>> 24] ^ t1[c >> 16 & 255] ^ t2[d >> 8 & 255] ^ t3[a & 255] ^ key[kIndex + 1];
+            c2 = t0[c >>> 24] ^ t1[d >> 16 & 255] ^ t2[a >> 8 & 255] ^ t3[b & 255] ^ key[kIndex + 2];
+            d = t0[d >>> 24] ^ t1[a >> 16 & 255] ^ t2[b >> 8 & 255] ^ t3[c & 255] ^ key[kIndex + 3];
+            kIndex += 4;
+            a = a2; b = b2; c = c2;
+        }
+
+        // Last round.
+        for (i = 0; i < 4; i++) {
+            out[dir ? 3 & -i : i] =
+                sbox[a >>> 24] << 24 ^
+                sbox[b >> 16 & 255] << 16 ^
+                sbox[c >> 8 & 255] << 8 ^
+                sbox[d & 255] ^
+                key[kIndex++];
+            a2 = a; a = b; b = c; c = d; d = a2;
+        }
+
+        return out;
+    }
+};
+
+/** @fileOverview HMAC implementation.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/** HMAC with the specified hash function.
+ * @constructor
+ * @param {bitArray} key the key for HMAC.
+ * @param {Object} [Hash=sjcl.hash.sha1] The hash function to use.
+ */
+sjcl.misc.hmac = function (key, Hash) {
+    this._hash = Hash = Hash || sjcl.hash.sha1;
+    var exKey = [[], []], i,
+        bs = Hash.prototype.blockSize / 32;
+    this._baseHash = [new Hash(), new Hash()];
+
+    if (key.length > bs) {
+        key = Hash.hash(key);
+    }
+
+    for (i = 0; i < bs; i++) {
+        exKey[0][i] = key[i] ^ 0x36363636;
+        exKey[1][i] = key[i] ^ 0x5C5C5C5C;
+    }
+
+    this._baseHash[0].update(exKey[0]);
+    this._baseHash[1].update(exKey[1]);
+    this._resultHash = new Hash(this._baseHash[0]);
+};
+
+/** HMAC with the specified hash function.  Also called encrypt since it's a prf.
+ * @param {bitArray|String} data The data to mac.
+ */
+sjcl.misc.hmac.prototype.encrypt = sjcl.misc.hmac.prototype.mac = function (data) {
+    if (!this._updated) {
+        this.update(data);
+        return this.digest(data);
+    } else {
+        throw new sjcl.exception.invalid("encrypt on already updated hmac called!");
+    }
+};
+
+sjcl.misc.hmac.prototype.reset = function () {
+    this._resultHash = new this._hash(this._baseHash[0]);
+    this._updated = false;
+};
+
+sjcl.misc.hmac.prototype.update = function (data) {
+    this._updated = true;
+    this._resultHash.update(data);
+};
+
+sjcl.misc.hmac.prototype.digest = function () {
+    var w = this._resultHash.finalize(), result = new (this._hash)(this._baseHash[1]).update(w).finalize();
+
+    this.reset();
+
+    return result;
+};
+
+/** @fileOverview Password-based key-derivation function, version 2.0.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+/** Password-Based Key-Derivation Function, version 2.0.
+ *
+ * Generate keys from passwords using PBKDF2-HMAC-SHA1.
+ *
+ * This is the method specified by RSA's PKCS #5 standard.
+ *
+ * @param {bitArray|String} password  The password.
+ * @param {bitArray|String} salt The salt.  Should have lots of entropy.
+ * @param {Number} [count=1000] The number of iterations.  Higher numbers make the function slower but more secure.
+ * @param {Number} [length] The length of the derived key.  Defaults to the
+                            output size of the hash function.
+ * @param {Object} [Prff=sjcl.misc.hmac] The pseudorandom function family.
+ * @return {bitArray} the derived key.
+ */
+sjcl.misc.pbkdf2 = function (password, salt, count, length, Prff) {
+    count = count || 10000;
+
+    if (length < 0 || count < 0) {
+        throw new sjcl.exception.invalid("invalid params to pbkdf2");
+    }
+
+    if (typeof password === "string") {
+        password = sjcl.codec.utf8String.toBits(password);
+    }
+
+    if (typeof salt === "string") {
+        salt = sjcl.codec.utf8String.toBits(salt);
+    }
+
+    Prff = Prff || sjcl.misc.hmac;
+
+    var prf = new Prff(password),
+        u, ui, i, j, k, out = [], b = sjcl.bitArray;
+
+    for (k = 1; 32 * out.length < (length || 1); k++) {
+        u = ui = prf.encrypt(b.concat(salt, [k]));
+
+        for (i = 1; i < count; i++) {
+            ui = prf.encrypt(ui);
+            for (j = 0; j < ui.length; j++) {
+                u[j] ^= ui[j];
+            }
+        }
+
+        out = out.concat(u);
+    }
+
+    if (length) { out = b.clamp(out, length); }
+
+    return out;
+};
+
+/**
+ * Random values
+ * @namespace
+ */
+sjcl.random = {
+    /**
+     * Generate cryptographically strong random words using native crypto module if it exists.
+     * 
+     * In react-native or other non native crypto environment, user could define a crypto module from gloabl variable.
+     * 
+     * If the crypto module doesn't exist, then using pure js implementation function.
+     * 
+     * @param {Number} nbytes The number of bytes to generate.
+     * @return {bitArray} The random words.
+     */
+    randomWords: function (nbytes) {
+        function getCryptoModule() {
+            try {
+                return require('crypto');
+            }
+            catch (e) {
+                return null;
+            }
+        }
+
+        var crypto;
+        if (typeof window !== 'undefined') {
+            // Native crypto from window (Browser)
+            if (window.crypto) {
+                crypto = window.crypto;
+            }else if(window.msCrypto) {
+                crypto = window.msCrypto;
+            }
+        } else if (typeof self !== 'undefined' && self.crypto) {
+            // Native crypto from web worker (Browser)
+            crypto = self.crypto;
+        } else if (typeof module !== 'undefined' && module.exports) {
+            // Native crypto import from NodeJS
+            crypto = getCryptoModule();
+        } else if (typeof global !== 'undefined' && global.crypto) {
+            // Native crypto from global variable
+            crypto = global.crypto;
+        }
+
+        // Get cryptographically strong random values depending on runtime environment
+        try {
+            if (crypto) {
+                if (crypto.getRandomValues) {
+                    return sjcl.codec.bytes.toBits(crypto.getRandomValues(new Uint8Array(nbytes)));
+                }
+                if (crypto.randomBytes) {
+                    return sjcl.codec.bytes.toBits(new Uint8Array(crypto.randomBytes(nbytes)));
+                }
+            } else {
+                return getRandomValues(nbytes);
+            }
+        } catch (e) {
+            return getRandomValues(nbytes);
+        }
+    },
+    
+    /** 
+     * Generate random words with pure js, cryptographically not as strong & safe as native implementation.
+     * @param {Number} nbytes The number of bytes to generate.
+     * @return {bitArray} The random words.
+     */
+    getRandomValues: function (nbytes) {
+        var words = [];
+
+        var r = function (m_w) {
+            var m_w = m_w;
+            var m_z = 0x3ade68b1;
+            var mask = 0xffffffff;
+
+            return function () {
+                m_z = (0x9069 * (m_z & 0xFFFF) + (m_z >> 0x10)) & mask;
+                m_w = (0x4650 * (m_w & 0xFFFF) + (m_w >> 0x10)) & mask;
+                var result = ((m_z << 0x10) + m_w) & mask;
+                result /= 0x100000000;
+                result += 0.5;
+                return result * (Math.random() > .5 ? 1 : -1);
+            }
+        };
+
+        for (var i = 0, rcache; i < nbytes; i += 4) {
+            var _r = r((rcache || Math.random()) * 0x100000000);
+            rcache = _r() * 0x3ade67b7;
+            words.push((_r() * 0x100000000) | 0);
+        }
+
+        return words
+    }
+}
+
+/** @fileOverview CTR mode implementation.
+ *
+ * Special thanks to Roy Nicholson for pointing out a bug in our
+ * implementation.
+ *
+ * @author Emily Stark
+ * @author Mike Hamburg
+ * @author Dan Boneh
+ */
+
+ /** Brian Gladman's CTR Mode.
+ * @constructor
+ * @param {Object} _prf The aes instance to generate key.
+ * @param {bitArray} _iv The iv for ctr mode, it must be 128 bits.
+ */
+/**
+ * Brian Gladman's CTR Mode.
+ * @namespace
+ */
+sjcl.mode.ctrGladman = function(prf, iv) {
+    this._prf = prf;
+    this._initIv = iv;
+    this._iv = iv;
+};
+
+sjcl.mode.ctrGladman.prototype.reset = function () {
+    this._iv = this._initIv;
+}
+
+/** Input some data to calculate.
+ * @param {bitArray} data the data to process, it must be intergral multiple of 128 bits unless it's the last.
+ */
+sjcl.mode.ctrGladman.prototype.update = function (data) {
+    return this.calculate(this._prf, data, this._iv);
+}
+
+sjcl.mode.ctrGladman.incWord =  function (word) {
+    if (((word >> 24) & 0xff) === 0xff) { //overflow
+        var b1 = (word >> 16) & 0xff;
+        var b2 = (word >> 8) & 0xff;
+        var b3 = word & 0xff;
+
+        if (b1 === 0xff) { // overflow b1   
+            b1 = 0;
+            if (b2 === 0xff) {
+                b2 = 0;
+                if (b3 === 0xff) {
+                    b3 = 0;
+                } else {
+                    ++b3;
+                }
+            } else {
+                ++b2;
+            }
+        } else {
+            ++b1;
+        }
+
+        word = 0;
+        word += (b1 << 16);
+        word += (b2 << 8);
+        word += b3;
+    } else {
+        word += (0x01 << 24);
+    }
+    return word;
+};
+
+sjcl.mode.ctrGladman.incCounter = function (counter) {
+    if ((counter[0] = sjcl.mode.ctrGladman.incWord(counter[0])) === 0) {
+        // encr_data in fileenc.c from  Dr Brian Gladman's counts only with DWORD j < 8
+        counter[1] = sjcl.mode.ctrGladman.incWord(counter[1]);
+    }
+};
+
+sjcl.mode.ctrGladman.prototype.calculate = function (prf, data, iv) {
+    var l, bl, e, i;
+    if (!(l = data.length)) {
+        return [];
+    }
+    bl = sjcl.bitArray.bitLength(data);
+    for (i = 0; i < l; i += 4) {
+        sjcl.mode.ctrGladman.incCounter(iv);
+        e = prf.encrypt(iv);
+        data[i] ^= e[0];
+        data[i + 1] ^= e[1];
+        data[i + 2] ^= e[2];
+        data[i + 3] ^= e[3];
+    }
+    return sjcl.bitArray.clamp(data, bl);
+}
+
+module.exports = sjcl;
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"crypto":undefined}],26:[function(require,module,exports){
 'use strict';
 
 var GenericWorker = require('./GenericWorker');
@@ -2060,7 +3326,7 @@ ConvertWorker.prototype.processChunk = function (chunk) {
 };
 module.exports = ConvertWorker;
 
-},{"../utils":32,"./GenericWorker":28}],25:[function(require,module,exports){
+},{"../utils":34,"./GenericWorker":30}],27:[function(require,module,exports){
 'use strict';
 
 var GenericWorker = require('./GenericWorker');
@@ -2086,7 +3352,7 @@ Crc32Probe.prototype.processChunk = function (chunk) {
 };
 module.exports = Crc32Probe;
 
-},{"../crc32":4,"../utils":32,"./GenericWorker":28}],26:[function(require,module,exports){
+},{"../crc32":5,"../utils":34,"./GenericWorker":30}],28:[function(require,module,exports){
 'use strict';
 
 var utils = require('../utils');
@@ -2117,7 +3383,7 @@ DataLengthProbe.prototype.processChunk = function (chunk) {
 module.exports = DataLengthProbe;
 
 
-},{"../utils":32,"./GenericWorker":28}],27:[function(require,module,exports){
+},{"../utils":34,"./GenericWorker":30}],29:[function(require,module,exports){
 'use strict';
 
 var utils = require('../utils');
@@ -2235,7 +3501,7 @@ DataWorker.prototype._tick = function() {
 
 module.exports = DataWorker;
 
-},{"../utils":32,"./GenericWorker":28}],28:[function(require,module,exports){
+},{"../utils":34,"./GenericWorker":30}],30:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2500,7 +3766,7 @@ GenericWorker.prototype = {
 
 module.exports = GenericWorker;
 
-},{}],29:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 'use strict';
 
 var utils = require('../utils');
@@ -2714,7 +3980,7 @@ StreamHelper.prototype = {
 
 module.exports = StreamHelper;
 
-},{"../base64":1,"../external":6,"../nodejs/NodejsStreamOutputAdapter":13,"../support":30,"../utils":32,"./ConvertWorker":24,"./GenericWorker":28}],30:[function(require,module,exports){
+},{"../base64":2,"../external":7,"../nodejs/NodejsStreamOutputAdapter":14,"../support":32,"../utils":34,"./ConvertWorker":26,"./GenericWorker":30}],32:[function(require,module,exports){
 'use strict';
 
 exports.base64 = true;
@@ -2754,7 +4020,7 @@ try {
     exports.nodestream = false;
 }
 
-},{"readable-stream":16}],31:[function(require,module,exports){
+},{"readable-stream":17}],33:[function(require,module,exports){
 'use strict';
 
 var utils = require('./utils');
@@ -3031,7 +4297,7 @@ Utf8EncodeWorker.prototype.processChunk = function (chunk) {
 };
 exports.Utf8EncodeWorker = Utf8EncodeWorker;
 
-},{"./nodejsUtils":14,"./stream/GenericWorker":28,"./support":30,"./utils":32}],32:[function(require,module,exports){
+},{"./nodejsUtils":15,"./stream/GenericWorker":30,"./support":32,"./utils":34}],34:[function(require,module,exports){
 'use strict';
 
 var support = require('./support');
@@ -3509,7 +4775,7 @@ exports.prepareContent = function(name, inputData, isBinary, isOptimizedBinarySt
     });
 };
 
-},{"./base64":1,"./external":6,"./nodejsUtils":14,"./support":30,"set-immediate-shim":54}],33:[function(require,module,exports){
+},{"./base64":2,"./external":7,"./nodejsUtils":15,"./support":32,"set-immediate-shim":56}],35:[function(require,module,exports){
 'use strict';
 var readerFor = require('./reader/readerFor');
 var utils = require('./utils');
@@ -3634,6 +4900,7 @@ ZipEntries.prototype = {
             file.readLocalPart(this.reader);
             file.handleUTF8();
             file.processAttributes();
+            file.readCompressed(this.reader);
         }
     },
     /**
@@ -3645,7 +4912,8 @@ ZipEntries.prototype = {
         this.reader.setIndex(this.centralDirOffset);
         while (this.reader.readAndCheckSignature(sig.CENTRAL_FILE_HEADER)) {
             file = new ZipEntry({
-                zip64: this.zip64
+                zip64: this.zip64,
+                aes: {}
             }, this.loadOptions);
             file.readCentralPart(this.reader);
             this.files.push(file);
@@ -3773,7 +5041,7 @@ ZipEntries.prototype = {
 // }}} end of ZipEntries
 module.exports = ZipEntries;
 
-},{"./reader/readerFor":22,"./signature":23,"./support":30,"./utf8":31,"./utils":32,"./zipEntry":34}],34:[function(require,module,exports){
+},{"./reader/readerFor":23,"./signature":24,"./support":32,"./utf8":33,"./utils":34,"./zipEntry":36}],36:[function(require,module,exports){
 'use strict';
 var readerFor = require('./reader/readerFor');
 var utils = require('./utils');
@@ -3836,7 +5104,7 @@ ZipEntry.prototype = {
      * @param {DataReader} reader the reader to use.
      */
     readLocalPart: function(reader) {
-        var compression, localExtraFieldsLength;
+        var localExtraFieldsLength;
 
         // we already know everything from the central dir !
         // If the central dir data are false, we are doomed.
@@ -3865,11 +5133,31 @@ ZipEntry.prototype = {
             throw new Error("Bug or corrupted zip : didn't get enough information from the central directory " + "(compressedSize === -1 || uncompressedSize === -1)");
         }
 
-        compression = findCompression(this.compressionMethod);
+    },
+
+    /**
+     * Read the compressed file data of a zip file and add the info in this object.
+     * @param {DataReader} reader the reader to use.
+     */
+    readCompressed: function(reader) {
+        var compression = findCompression(this.compressionMethod);
         if (compression === null) { // no compression found
             throw new Error("Corrupted zip : compression " + utils.pretty(this.compressionMethod) + " unknown (inner file : " + utils.transformTo("string", this.fileName) + ")");
         }
-        this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, reader.readData(this.compressedSize));
+        var compressContent = reader.readData(this.compressedSize);
+        var decryptOptions = {
+            password: null,
+            strength: null
+        };
+        if (this.isEncrypted() && !this.dir) {
+            if (!this.options.aes.strength) {
+                throw new Error("Encrypted zip: unsupported encrypt method");
+            }
+            decryptOptions.password =  this.loadOptions.password;
+            decryptOptions.strength = this.options.aes.strength;
+            decryptOptions.version = this.options.aes.version;
+        } 
+        this.decompressed = new CompressedObject(this.compressedSize, this.uncompressedSize, this.crc32, compression, compressContent, decryptOptions);
     },
 
     /**
@@ -3894,14 +5182,11 @@ ZipEntry.prototype = {
         this.externalFileAttributes = reader.readInt(4);
         this.localHeaderOffset = reader.readInt(4);
 
-        if (this.isEncrypted()) {
-            throw new Error("Encrypted zip are not supported");
-        }
-
         // will be read in the local part, see the comments there
         reader.skip(fileNameLength);
         this.readExtraFields(reader);
         this.parseZIP64ExtraField(reader);
+        this.parseAESExtraField();
         this.fileComment = reader.readData(this.fileCommentLength);
     },
 
@@ -3962,6 +5247,24 @@ ZipEntry.prototype = {
             this.diskNumberStart = extraReader.readInt(4);
         }
     },
+
+    /**
+     * Parse the AES extra field and add the info in the aes options.
+     */
+    parseAESExtraField: function() {
+        if (!this.extraFields[0x9901]) {
+            return;
+        }
+
+        // should be something, preparing the extra reader
+        var extraReader = readerFor(this.extraFields[0x9901].value);
+
+        this.options.aes.version = extraReader.readInt(2);
+        extraReader.skip(2);
+        this.options.aes.strength = extraReader.readInt(1);
+        this.compressionMethod = this.options.aes.compressionMethod = extraReader.readString(2);
+    },
+
     /**
      * Read the central part of a zip file and add the info in this object.
      * @param {DataReader} reader the reader to use.
@@ -3990,6 +5293,7 @@ ZipEntry.prototype = {
 
         reader.setIndex(end);
     },
+    
     /**
      * Apply an UTF8 transformation if needed.
      */
@@ -4069,7 +5373,7 @@ ZipEntry.prototype = {
 };
 module.exports = ZipEntry;
 
-},{"./compressedObject":2,"./compressions":3,"./crc32":4,"./reader/readerFor":22,"./support":30,"./utf8":31,"./utils":32}],35:[function(require,module,exports){
+},{"./compressedObject":3,"./compressions":4,"./crc32":5,"./reader/readerFor":23,"./support":32,"./utf8":33,"./utils":34}],37:[function(require,module,exports){
 'use strict';
 
 var StreamHelper = require('./stream/StreamHelper');
@@ -4100,9 +5404,27 @@ var ZipObject = function(name, data, options) {
         compression : options.compression,
         compressionOptions : options.compressionOptions
     };
+    if (options.password || options.encryptStrength) {
+        this.encryptOptions = {
+            password: options.password,
+            strength: options.encryptStrength
+        };
+    }
 };
 
 ZipObject.prototype = {
+    /**
+     * Update the decrypt password for the compressed object.
+     * @param {String} password the decrypt password of the compressed object.
+     * @return this ZipObject object.
+     */
+    password: function (password) {
+        if (this._data.decryptOptions.strength) {
+            this._data.decryptOptions.password = password;
+        }
+        return this;
+    },
+
     /**
      * Create an internal stream for the content of this object.
      * @param {String} type the type of each chunk.
@@ -4164,10 +5486,12 @@ ZipObject.prototype = {
      * @param {Object} compressionOptions the options to use when compressing.
      * @return Worker the worker.
      */
-    _compressWorker: function (compression, compressionOptions) {
+    _compressWorker: function (compression, compressionOptions, encryptOptions) {
         if (
             this._data instanceof CompressedObject &&
-            this._data.compression.magic === compression.magic
+            this._data.compression.magic === compression.magic &&
+            this._data.decryptOptions.password === encryptOptions.password &&
+            this._data.decryptOptions.strength === encryptOptions.strength 
         ) {
             return this._data.getCompressedWorker();
         } else {
@@ -4175,7 +5499,7 @@ ZipObject.prototype = {
             if(!this._dataBinary) {
                 result = result.pipe(new utf8.Utf8EncodeWorker());
             }
-            return CompressedObject.createWorkerFrom(result, compression, compressionOptions);
+            return CompressedObject.createWorkerFrom(result, compression, compressionOptions, encryptOptions);
         }
     },
     /**
@@ -4204,7 +5528,7 @@ for(var i = 0; i < removedMethods.length; i++) {
 }
 module.exports = ZipObject;
 
-},{"./compressedObject":2,"./stream/DataWorker":27,"./stream/GenericWorker":28,"./stream/StreamHelper":29,"./utf8":31}],36:[function(require,module,exports){
+},{"./compressedObject":3,"./stream/DataWorker":29,"./stream/GenericWorker":30,"./stream/StreamHelper":31,"./utf8":33}],38:[function(require,module,exports){
 (function (global){
 'use strict';
 var Mutation = global.MutationObserver || global.WebKitMutationObserver;
@@ -4277,7 +5601,7 @@ function immediate(task) {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],37:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 'use strict';
 var immediate = require('immediate');
 
@@ -4552,7 +5876,7 @@ function race(iterable) {
   }
 }
 
-},{"immediate":36}],38:[function(require,module,exports){
+},{"immediate":38}],40:[function(require,module,exports){
 // Top level file is just a mixin of submodules & constants
 'use strict';
 
@@ -4568,7 +5892,7 @@ assign(pako, deflate, inflate, constants);
 
 module.exports = pako;
 
-},{"./lib/deflate":39,"./lib/inflate":40,"./lib/utils/common":41,"./lib/zlib/constants":44}],39:[function(require,module,exports){
+},{"./lib/deflate":41,"./lib/inflate":42,"./lib/utils/common":43,"./lib/zlib/constants":46}],41:[function(require,module,exports){
 'use strict';
 
 
@@ -4970,7 +6294,7 @@ exports.deflate = deflate;
 exports.deflateRaw = deflateRaw;
 exports.gzip = gzip;
 
-},{"./utils/common":41,"./utils/strings":42,"./zlib/deflate":46,"./zlib/messages":51,"./zlib/zstream":53}],40:[function(require,module,exports){
+},{"./utils/common":43,"./utils/strings":44,"./zlib/deflate":48,"./zlib/messages":53,"./zlib/zstream":55}],42:[function(require,module,exports){
 'use strict';
 
 
@@ -5390,7 +6714,7 @@ exports.inflate = inflate;
 exports.inflateRaw = inflateRaw;
 exports.ungzip  = inflate;
 
-},{"./utils/common":41,"./utils/strings":42,"./zlib/constants":44,"./zlib/gzheader":47,"./zlib/inflate":49,"./zlib/messages":51,"./zlib/zstream":53}],41:[function(require,module,exports){
+},{"./utils/common":43,"./utils/strings":44,"./zlib/constants":46,"./zlib/gzheader":49,"./zlib/inflate":51,"./zlib/messages":53,"./zlib/zstream":55}],43:[function(require,module,exports){
 'use strict';
 
 
@@ -5494,7 +6818,7 @@ exports.setTyped = function (on) {
 
 exports.setTyped(TYPED_OK);
 
-},{}],42:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
 // String encode/decode helpers
 'use strict';
 
@@ -5681,7 +7005,7 @@ exports.utf8border = function (buf, max) {
   return (pos + _utf8len[buf[pos]] > max) ? pos : max;
 };
 
-},{"./common":41}],43:[function(require,module,exports){
+},{"./common":43}],45:[function(require,module,exports){
 'use strict';
 
 // Note: adler32 takes 12% for level 0 and 2% for level 6.
@@ -5734,7 +7058,7 @@ function adler32(adler, buf, len, pos) {
 
 module.exports = adler32;
 
-},{}],44:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -5804,7 +7128,7 @@ module.exports = {
   //Z_NULL:                 null // Use -1 or null inline, depending on var type
 };
 
-},{}],45:[function(require,module,exports){
+},{}],47:[function(require,module,exports){
 'use strict';
 
 // Note: we can't get significant speed boost here.
@@ -5865,7 +7189,7 @@ function crc32(crc, buf, len, pos) {
 
 module.exports = crc32;
 
-},{}],46:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -7741,7 +9065,7 @@ exports.deflatePrime = deflatePrime;
 exports.deflateTune = deflateTune;
 */
 
-},{"../utils/common":41,"./adler32":43,"./crc32":45,"./messages":51,"./trees":52}],47:[function(require,module,exports){
+},{"../utils/common":43,"./adler32":45,"./crc32":47,"./messages":53,"./trees":54}],49:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -7801,7 +9125,7 @@ function GZheader() {
 
 module.exports = GZheader;
 
-},{}],48:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -8148,7 +9472,7 @@ module.exports = function inflate_fast(strm, start) {
   return;
 };
 
-},{}],49:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -9706,7 +11030,7 @@ exports.inflateSyncPoint = inflateSyncPoint;
 exports.inflateUndermine = inflateUndermine;
 */
 
-},{"../utils/common":41,"./adler32":43,"./crc32":45,"./inffast":48,"./inftrees":50}],50:[function(require,module,exports){
+},{"../utils/common":43,"./adler32":45,"./crc32":47,"./inffast":50,"./inftrees":52}],52:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -10051,7 +11375,7 @@ module.exports = function inflate_table(type, lens, lens_index, codes, table, ta
   return 0;
 };
 
-},{"../utils/common":41}],51:[function(require,module,exports){
+},{"../utils/common":43}],53:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -10085,7 +11409,7 @@ module.exports = {
   '-6':   'incompatible version' /* Z_VERSION_ERROR (-6) */
 };
 
-},{}],52:[function(require,module,exports){
+},{}],54:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -11307,7 +12631,7 @@ exports._tr_flush_block  = _tr_flush_block;
 exports._tr_tally = _tr_tally;
 exports._tr_align = _tr_align;
 
-},{"../utils/common":41}],53:[function(require,module,exports){
+},{"../utils/common":43}],55:[function(require,module,exports){
 'use strict';
 
 // (C) 1995-2013 Jean-loup Gailly and Mark Adler
@@ -11356,7 +12680,7 @@ function ZStream() {
 
 module.exports = ZStream;
 
-},{}],54:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 'use strict';
 module.exports = typeof setImmediate === 'function' ? setImmediate :
 	function setImmediate() {
@@ -11365,5 +12689,5 @@ module.exports = typeof setImmediate === 'function' ? setImmediate :
 		setTimeout.apply(null, args);
 	};
 
-},{}]},{},[10])(10)
+},{}]},{},[11])(11)
 });
